@@ -6,7 +6,7 @@ import torch
 from transformers import AutoImageProcessor, AutoModel
 from transformers.image_processing_base import BatchFeature
 
-class DINO:
+class DINO(torch.nn.Module):
   # Supported DINOv2 and DINOv3 models # TO DO: Add entire list of models
   SUPPORTED_MODELS = [
     "facebook/dinov3-vit7b16-pretrain-lvd1689m",
@@ -41,7 +41,8 @@ class DINO:
     """Check if a model name is in the supported list."""
     return model_name in cls.SUPPORTED_MODELS
   
-  def __init__(self, model_name: str):
+  def __init__(self, model_name: str, device: str = "cuda"):
+    super().__init__()
     if not self.is_supported(model_name):
       supported_str = "\n  ".join(self.SUPPORTED_MODELS)
       raise ValueError(
@@ -49,24 +50,30 @@ class DINO:
         f"Supported models are:\n  {supported_str}"
       )
     self.model_name = model_name
-    self.processor = AutoImageProcessor.from_pretrained(model_name)
+    self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
     self.model = AutoModel.from_pretrained(model_name)
     self.patch_size = self.model.config.patch_size
     if "num_register_tokens" not in self.model.config:
       self.num_register_tokens = 0
     else:
       self.num_register_tokens = self.model.config.num_register_tokens
+    
+    if device == "cuda" and not torch.cuda.is_available():
+      raise ValueError("CUDA is not available")
+    
+    self.device = torch.device(device)
+    self.model.to(self.device)
   
   def get_model_summary(self):
     print(self.model.config)
 
-  def preprocess(self, image: List[Image.Image]):
-    inputs = self.processor(images=image, return_tensors="pt") # eg [batch_size, 3, 224, 224]
+  def preprocess(self, image: List[Image.Image], device: str = "cuda"):
+    inputs = self.processor(images=image, return_tensors="pt", device=device) # eg [batch_size, 3, 224, 224]
     return inputs
   
   def forward(self, inputs: Union[List[Image.Image], BatchFeature]) -> torch.Tensor:
     if not isinstance(inputs, BatchFeature):
-      inputs = self.processor(images=inputs, return_tensors="pt") # eg [batch_size, 3, 224, 224]
+      inputs = self.processor(images=inputs, return_tensors="pt", device=self.device) # eg [batch_size, 3, 224, 224]
     outputs = self.model(**inputs) # eg [batch_size, 1 + 4 + 256, 384]
     return outputs # eg [batch_size, 1 + 4 + 256, 384]
   
@@ -76,7 +83,7 @@ class DINO:
       return outputs # eg [batch_size, 1 + 4 + 256, 384]
     
   def get_patch_tokens(self, images: List[Image.Image]) -> torch.Tensor:
-    inputs = self.preprocess(images) # eg [batch_size, 3, 224, 224]
+    inputs = self.preprocess(images, device=self.device) # eg [batch_size, 3, 224, 224]
     outputs = self.forward(inputs)
     _, _, img_height, img_width = inputs.pixel_values.shape
     num_patches_height, num_patches_width = img_height // self.patch_size, img_width // self.patch_size
@@ -85,7 +92,7 @@ class DINO:
     return patch_features # eg [batch_size, 16, 16, 384]
   
   def get_cls_tokens(self, images: List[Image.Image]) -> torch.Tensor:
-    inputs = self.preprocess(images) # eg [batch_size, 3, 224, 224]
+    inputs = self.preprocess(images, device=self.device) # eg [batch_size, 3, 224, 224]
     outputs = self.forward(inputs)
     cls_token = outputs.last_hidden_state[:, 0, :] # eg [batch_size, 384]
     return cls_token
@@ -93,7 +100,7 @@ class DINO:
   def get_register_tokens(self, images: List[Image.Image]) -> torch.Tensor:
     if self.num_register_tokens == 0:
       raise ValueError(f"This model {self.model_name} has no register tokens")
-    inputs = self.preprocess(images) # eg [batch_size, 3, 224, 224]
+    inputs = self.preprocess(images, device=self.device) # eg [batch_size, 3, 224, 224]
     outputs = self.forward(inputs)
     register_tokens = outputs.last_hidden_state[:, 1:1 + self.num_register_tokens, :]
     return register_tokens # eg [batch_size, 4, 384]
@@ -107,6 +114,7 @@ if __name__ == "__main__":
   parser.add_argument("--model_name", type=str, default="facebook/dinov3-vits16-pretrain-lvd1689m", help="Model name or path to use")
   parser.add_argument("--image_url", type=str, default="http://images.cocodataset.org/val2017/000000039769.jpg", help="Image URL to load")
   parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
+  parser.add_argument("--device", type=str, default="cuda", help="Device to use")
   args = parser.parse_args()
 
   load_dotenv()
@@ -115,7 +123,8 @@ if __name__ == "__main__":
   image = load_image(args.image_url)
   images = [image] * args.batch_size
 
-  model = DINO(args.model_name)
+  model = DINO(args.model_name, device=args.device)
+  print(model.device)
   patch_features = model.get_patch_tokens(images)
   cls_token = model.get_cls_tokens(images)
   register_tokens = model.get_register_tokens(images)
