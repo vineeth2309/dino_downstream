@@ -1,0 +1,12 @@
+[project]
+name = "dinov3-downstream"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.1"
+dependencies = [
+    "numpy>=2.3.4",
+    "python-dotenv>=1.2.1",
+    "torch==2.4.1",
+    "transformers>=4.57.1",
+]

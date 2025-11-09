@@ -1,0 +1,4 @@
+from backbone.dino import DINO
+
+SUPPORTED_MODELS = DINO.SUPPORTED_MODELS
+__all__ = ["DINO", "SUPPORTED_MODELS"]
