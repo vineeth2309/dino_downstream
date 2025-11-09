@@ -73,13 +73,14 @@ uv run python -m backbone.dino --model_name <model_name> [options]
 
 **Example:**
 ```bash
-uv run python -m backbone.dino --model_name facebook/dinov3-vits16-pretrain-lvd1689m --image_url http://images.cocodataset.org/val2017/000000039769.jpg --batch_size 4
+uv run python -m backbone.dino --model_name facebook/dinov3-vits16-pretrain-lvd1689m --image_url http://images.cocodataset.org/val2017/000000039769.jpg --batch_size 4 --device cuda
 ```
 
 **Arguments:**
 - `--model_name`: Name of the DINO model to use (see supported models below)
 - `--image_url`: URL of the image to process (default: COCO validation image)
 - `--batch_size`: Batch size for inference (default: 4)
+- `--device`: Device to use for inference, either "cuda" or "cpu" (default: "cuda")
 
 ### Using as a Backbone in Your Code
 
@@ -87,8 +88,11 @@ uv run python -m backbone.dino --model_name facebook/dinov3-vits16-pretrain-lvd1
 from backbone.dino import DINO
 from PIL import Image
 
-# Initialize the model
-model = DINO("facebook/dinov3-vits16-pretrain-lvd1689m")
+# Initialize the model (defaults to "cuda" if available)
+model = DINO("facebook/dinov3-vits16-pretrain-lvd1689m", device="cuda")
+
+# Or use CPU
+# model = DINO("facebook/dinov3-vits16-pretrain-lvd1689m", device="cpu")
 
 # Load images
 images = [Image.open("path/to/image.jpg")]
