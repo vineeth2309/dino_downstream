@@ -1,10 +1,66 @@
 import os
-from typing import List, Union
+from typing import List, Union, Literal, Optional
 from dotenv import load_dotenv
+from dataclasses import dataclass
 from PIL import Image
 import torch
 from transformers import AutoImageProcessor, AutoModel
 from transformers.image_processing_base import BatchFeature
+from peft import LoraConfig, get_peft_model, PeftModel
+
+@dataclass
+class LoRAConfig:
+  """
+  Configuration for LoRA adaptation.
+  
+  Research-based target module strategies:
+  - "qv": Original LoRA paper approach (Q and V only) - most conservative
+  - "qkv": Q, K, V projections (stable, parameter efficient)
+  - "qkv_proj": QKV + output projection
+  - "mlp": Only MLP layers (recent research shows can match attention-only)
+  - "all": All layers
+  
+  Original LoRA paper (Hu et al., 2021) used Wq and Wv for GPT-3.
+  """
+  r: int = 8  # LoRA rank
+  lora_alpha: int = 8  # LoRA scaling factor
+  lora_dropout: float = 0.1
+  target_modules: Union[List[str], Literal["qkv", "qv", "qkv_proj", "mlp", "all"]] = "qv"
+  bias: str = "none"  # Options: "none", "all", "lora_only"
+  
+  def get_target_modules(self, model_type: str) -> List[str]:
+    """
+    Get target modules based on configuration and model type.
+    Configurations for VIT's:
+    - qv: Q and V only (original LoRA paper recommendation)
+    - qkv: Q, K, V projections in attention (stable, parameter efficient)
+    - qkv_proj: QKV + output projection (attention with output)
+    - mlp: Only MLP layers (recent research shows can match/exceed attention-only)
+    - all: All layers
+    """
+    is_dinov2 = "dinov2" in model_type.lower()
+    
+    if is_dinov2:
+      modules_map = {
+        "qv": ["attention.attention.query", "attention.attention.value"],
+        "qkv": ["attention.attention.query", "attention.attention.key", "attention.attention.value"],
+        "qkv_proj": ["attention.attention.query", "attention.attention.key", "attention.attention.value", "attention.output.dense"],
+        "mlp": ["mlp.fc1", "mlp.fc2"],
+        "all": ["attention.attention.query", "attention.attention.key", "attention.attention.value", "attention.output.dense", "mlp.fc1", "mlp.fc2"]
+      }
+    else:  # DINOv3
+      modules_map = {
+        "qv": ["attention.q_proj", "attention.v_proj"],
+        "qkv": ["attention.q_proj", "attention.k_proj", "attention.v_proj"],
+        "qkv_proj": ["attention.q_proj", "attention.k_proj", "attention.v_proj", "attention.o_proj"],
+        "mlp": ["mlp.up_proj", "mlp.down_proj"],
+        "all": ["attention.q_proj", "attention.k_proj", "attention.v_proj", "attention.o_proj", "mlp.up_proj", "mlp.down_proj"]
+      }
+    
+    if isinstance(self.target_modules, str):
+      return modules_map.get(self.target_modules, modules_map["qv"])
+    else:
+      return self.target_modules
 
 class DINO(torch.nn.Module):
   # Supported DINOv2 and DINOv3 models # TO DO: Add entire list of models
@@ -41,7 +97,12 @@ class DINO(torch.nn.Module):
     """Check if a model name is in the supported list."""
     return model_name in cls.SUPPORTED_MODELS
   
-  def __init__(self, model_name: str, device: str = "cuda"):
+  def __init__(
+    self, 
+    model_name: str, 
+    device: str = "cuda", 
+    lora_config: Optional[LoRAConfig] = None
+  ):
     super().__init__()
     if not self.is_supported(model_name):
       supported_str = "\n  ".join(self.SUPPORTED_MODELS)
@@ -50,8 +111,18 @@ class DINO(torch.nn.Module):
         f"Supported models are:\n  {supported_str}"
       )
     self.model_name = model_name
+    self.lora_enabled = False
+
     self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
     self.model = AutoModel.from_pretrained(model_name)
+
+    if lora_config:
+      peft_config = self._create_peft_config(lora_config)
+      self.model = get_peft_model(self.model, peft_config)
+      self.lora_enabled = True
+      print(f"LoRA enabled with config: {lora_config}")
+      self.print_trainable_parameters()
+
     self.patch_size = self.model.config.patch_size
     if "num_register_tokens" not in self.model.config:
       self.num_register_tokens = 0
@@ -64,6 +135,49 @@ class DINO(torch.nn.Module):
     self.device = torch.device(device)
     self.model.to(self.device)
   
+  def list_modules(self):
+    """Print all module names in the model"""
+    for name, _ in self.model.named_modules():
+        print(name)
+
+  def _create_peft_config(self, lora_config: LoRAConfig) -> LoraConfig:
+    """Create PEFT LoraConfig from our LoRAConfig"""
+    target_modules = lora_config.get_target_modules(self.model_name)
+    
+    return LoraConfig(
+      r=lora_config.r,
+      lora_alpha=lora_config.lora_alpha,
+      target_modules=target_modules,
+      lora_dropout=lora_config.lora_dropout,
+      bias=lora_config.bias,
+      task_type=None
+    )
+  
+  def print_trainable_parameters(self):
+    """Print the number of trainable parameters"""
+    if hasattr(self.model, 'print_trainable_parameters'):
+      self.model.print_trainable_parameters()
+    else:
+      trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+      all_params = sum(p.numel() for p in self.model.parameters())
+      print(f"trainable params: {trainable_params:,} || all params: {all_params:,} || "
+            f"trainable%: {100 * trainable_params / all_params:.2f}")
+  
+  def save_lora_weights(self, path: str):
+    """Save only LoRA adapter weights"""
+    if not self.lora_enabled:
+      raise ValueError("LoRA is not enabled for this model")
+    self.model.save_pretrained(path)
+    print(f"LoRA weights saved to {path}")
+  
+  def merge_and_unload(self):
+    """Merge LoRA weights into base model and remove adapters"""
+    if not self.lora_enabled:
+      raise ValueError("LoRA is not enabled for this model")
+    self.model = self.model.merge_and_unload()
+    self.lora_enabled = False
+    print("LoRA weights merged into base model")
+
   def get_model_summary(self):
     print(self.model.config)
 
@@ -115,6 +229,14 @@ if __name__ == "__main__":
   parser.add_argument("--image_url", type=str, default="http://images.cocodataset.org/val2017/000000039769.jpg", help="Image URL to load")
   parser.add_argument("--batch_size", type=int, default=4, help="Batch size for inference")
   parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+  # LoRA arguments
+  parser.add_argument("--use_lora", type=bool, default=False, help="Enable LoRA adapters")
+  parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+  parser.add_argument("--lora_alpha", type=int, default=8, help="LoRA alpha")
+  parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+  parser.add_argument("--lora_target", type=str, default="all", 
+                     choices=["qkv", "qv", "qkv_proj", "mlp", "all"],
+                     help="Which modules to apply LoRA to")
   args = parser.parse_args()
 
   load_dotenv()
@@ -123,15 +245,30 @@ if __name__ == "__main__":
   image = load_image(args.image_url)
   images = [image] * args.batch_size
 
-  model = DINO(args.model_name, device=args.device)
-  print(model.device)
+  if args.use_lora:
+    lora_config = LoRAConfig(
+      r=args.lora_r,
+      lora_alpha=args.lora_alpha,
+      lora_dropout=args.lora_dropout,
+      target_modules=args.lora_target
+    )
+    model = DINO(args.model_name, device=args.device, lora_config=lora_config)
+  else:
+    model = DINO(args.model_name, device=args.device)
+
   patch_features = model.get_patch_tokens(images)
   cls_token = model.get_cls_tokens(images)
-  register_tokens = model.get_register_tokens(images)
+  if 'dinov3' in args.model_name.lower() or 'register' in args.model_name.lower():
+    register_tokens = model.get_register_tokens(images)
+  else:
+    register_tokens = None
   forward_output = model.forward(images)
-  
+
   print(model.get_model_summary())
   print("cls_token.shape:", cls_token.shape)
-  print("register_tokens.shape:", register_tokens.shape)
+  if register_tokens is not None:
+    print("register_tokens.shape:", register_tokens.shape)
+  else:
+    print("register_tokens: None")
   print("patch_features.shape:", patch_features.shape)
   print("forward_output.last_hidden_state.shape:", forward_output.last_hidden_state.shape)
