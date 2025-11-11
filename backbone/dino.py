@@ -1,5 +1,7 @@
 import os
+import json
 from typing import List, Union, Literal, Optional
+from pathlib import Path
 from dotenv import load_dotenv
 from dataclasses import dataclass
 from PIL import Image
@@ -218,6 +220,104 @@ class DINO(torch.nn.Module):
     outputs = self.forward(inputs)
     register_tokens = outputs.last_hidden_state[:, 1:1 + self.num_register_tokens, :]
     return register_tokens # eg [batch_size, 4, 384]
+
+  def save_model(self, path: str, merge_lora: bool = False):
+    """
+    Save the model and processor to disk.
+    
+    Args:
+      path: Directory to save model
+      merge_lora: If True and LoRA is enabled, merge adapters into base model and save as full model.
+                  If False (default), save LoRA adapters separately for continued training.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    
+    if self.lora_enabled and merge_lora:
+      # Merge LoRA and save as full model
+      print("Merging LoRA adapters into base model...")
+      model_to_save = self.model.merge_and_unload()
+      model_to_save.save_pretrained(path)
+      self.model = model_to_save
+      self.lora_enabled = False
+      lora_state = "merged"
+    elif self.lora_enabled:
+      # Save LoRA adapters separately (lightweight, can continue training)
+      print("Saving LoRA adapters...")
+      self.model.save_pretrained(path)  # PEFT automatically saves only adapters
+      lora_state = "lora"
+    else:
+      # Save full model (no LoRA)
+      self.model.save_pretrained(path)
+      lora_state = "none"
+    
+    self.processor.save_pretrained(path)
+    
+    metadata = {
+      "model_name": self.model_name,
+      "patch_size": self.patch_size,
+      "num_register_tokens": self.num_register_tokens,
+      "lora_state": lora_state,  # "none", "lora", or "merged"
+    }
+    with open(path / "dino_metadata.json", "w") as f:
+      json.dump(metadata, f, indent=2)
+    
+    print(f"Model saved to {path}")
+  
+  @classmethod
+  def load_model(cls, path: str, device: str = "cuda"):
+    """
+    Load a saved model from disk.
+    Automatically detects if it contains LoRA adapters, merged weights, or full model.
+    Uses the metadata file to determine the model type.
+    
+    Args:
+      path: Directory containing saved model
+      device: Device to load model on
+    
+    Returns:
+      DINO instance with loaded weights
+    """
+    path = Path(path)
+    
+    if not path.exists():
+      raise ValueError(f"Path does not exist: {path}")
+    
+    # Load metadata
+    metadata_path = path / "dino_metadata.json"
+    if not metadata_path.exists():
+      raise ValueError(f"No DINO metadata found at {path}. Not a valid DINO model save.")
+    
+    with open(metadata_path, "r") as f:
+      metadata = json.load(f)
+    
+    model_name = metadata["model_name"]
+    lora_state = metadata.get("lora_state", "none")
+    
+    # Create instance without initializing model first
+    instance = object.__new__(cls)
+    # Initialize the nn.Module parent class first (required before assigning modules)
+    super(DINO, instance).__init__()
+    
+    instance.model_name = model_name
+    instance.patch_size = metadata["patch_size"]
+    instance.num_register_tokens = metadata["num_register_tokens"]
+    instance.device = torch.device(device)
+    instance.processor = AutoImageProcessor.from_pretrained(path, use_fast=True)
+    
+    # Load model based on lora_state
+    if lora_state == "lora":
+      base_model = AutoModel.from_pretrained(model_name)
+      instance.model = PeftModel.from_pretrained(base_model, path)
+      instance.lora_enabled = True
+      print(f"Loaded model with lora from {path}")
+    else:
+      instance.model = AutoModel.from_pretrained(path)
+      instance.lora_enabled = False
+      print(f"Loaded full model from {path}")
+    
+    instance.model.to(instance.device)
+    return instance
 
 if __name__ == "__main__":
   import argparse

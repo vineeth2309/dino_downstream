@@ -149,3 +149,20 @@ Use `DINO.list_supported_models()` to see the full list of supported model names
 - transformers >= 4.57.1
 - peft (for LoRA support)
 
+## Testing
+
+Run the test suite with:
+
+```bash
+uv run pytest tests/ -v
+```
+
+The test suite verifies model save/load functionality:
+
+- **Base model save/load**: Tests saving and loading models without LoRA, verifying weight persistence and output consistency
+- **LoRA adapters save/load**: Tests saving and loading LoRA adapters separately (unmerged) for continued training
+- **Merged LoRA save/load**: Tests saving and loading LoRA with merged weights into the base model
+- **Weight modification verification**: Sanity check ensuring weight modifications actually change model weights
+
+All tests use deterministic weight values to verify actual persistence rather than random initialization.
+
